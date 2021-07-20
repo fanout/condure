@@ -23,9 +23,14 @@ use crate::connection::{
     Want, ZhttpSender,
 };
 use crate::event;
+use crate::executor::{Executor, Spawner};
+use crate::future::{
+    event_wait, select_2, select_3, select_4, select_6, select_option, sleep, AsyncLocalReceiver,
+    AsyncLocalSender, AsyncReceiver, AsyncSleep, Select2, Select3, Select4, Select6,
+};
 use crate::list;
 use crate::listener::Listener;
-use crate::timer;
+use crate::reactor::Reactor;
 use crate::tls::{IdentityCache, TlsAcceptor, TlsStream};
 use crate::tnetstring;
 use crate::zhttppacket;
@@ -38,9 +43,6 @@ use mio::net::{TcpListener, TcpSocket, TcpStream};
 use mio::unix::SourceFd;
 use slab::Slab;
 use std::cell::{Cell, RefCell};
-use std::cmp;
-use std::collections::VecDeque;
-use std::convert::TryFrom;
 use std::io;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -66,39 +68,17 @@ const RESP_SENDER_BOUND: usize = 1;
 // where N is the channel bound
 pub const MSG_RETAINED_MAX: usize = 1 + RESP_SENDER_BOUND;
 
-const STOP_TOKEN: mio::Token = mio::Token(1);
-const REQ_ACCEPTOR_TOKEN: mio::Token = mio::Token(2);
-const STREAM_ACCEPTOR_TOKEN: mio::Token = mio::Token(3);
-const REQ_HANDLE_READ_TOKEN: mio::Token = mio::Token(4);
-const REQ_HANDLE_WRITE_TOKEN: mio::Token = mio::Token(5);
-const STREAM_HANDLE_READ_TOKEN: mio::Token = mio::Token(6);
-const STREAM_HANDLE_WRITE_ANY_TOKEN: mio::Token = mio::Token(7);
-const STREAM_HANDLE_WRITE_ADDR_TOKEN: mio::Token = mio::Token(8);
-const ZREQ_RECEIVER_TOKEN: mio::Token = mio::Token(9);
-const ZSTREAM_OUT_RECEIVER_TOKEN: mio::Token = mio::Token(10);
-const ZSTREAM_OUT_STREAM_RECEIVER_TOKEN: mio::Token = mio::Token(11);
-const ZSTREAM_OUT_STREAM_SENDER_TOKEN: mio::Token = mio::Token(12);
-
-const BASE_TOKENS: usize = 12;
-const CONN_BASE: usize = 16;
-const TOKENS_PER_CONN: usize = 8;
-const ACCEPT_PER_LOOP_MAX: usize = 100;
-const TICK_DURATION_MS: u64 = 10;
-const POLL_TIMEOUT_MAX: Duration = Duration::from_millis(100);
+// FIXME: ensure correct
+const WORKER_NON_CONNECTION_TASKS_MAX: usize = 10;
+const WORKER_NON_CONNECTION_REGISTRATIONS_MAX: usize = 100;
+const REGISTRATIONS_PER_CONNECTION: usize = 10;
+const REACTOR_BUDGET: u32 = 100;
 
 const KEEP_ALIVE_TIMEOUT_MS: usize = 45_000;
 const KEEP_ALIVE_BATCH_MS: usize = 100;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(KEEP_ALIVE_BATCH_MS as u64);
 const KEEP_ALIVE_BATCHES: usize = KEEP_ALIVE_TIMEOUT_MS / KEEP_ALIVE_BATCH_MS;
 const BULK_PACKET_SIZE_MAX: usize = 65_000;
-
-fn duration_to_ticks(d: Duration) -> u64 {
-    (d.as_millis() / (TICK_DURATION_MS as u128)) as u64
-}
-
-fn ticks_to_duration(t: u64) -> Duration {
-    Duration::from_millis(t * TICK_DURATION_MS)
-}
 
 fn get_addr_and_offset(msg: &[u8]) -> Result<(&str, usize), ()> {
     let mut pos = None;
@@ -232,6 +212,31 @@ fn set_socket_opts(stream: TcpStream) -> TcpStream {
     }
 
     unsafe { TcpStream::from_raw_fd(socket.into_raw_fd()) }
+}
+
+fn local_channel<T>(
+    bound: usize,
+    max_senders: usize,
+) -> (channel::LocalSender<T>, channel::LocalReceiver<T>) {
+    let (s, r) = channel::local_channel(
+        bound,
+        max_senders,
+        &Reactor::current().unwrap().local_registration_memory(),
+    );
+
+    (s, r)
+}
+
+fn async_local_channel<T>(
+    bound: usize,
+    max_senders: usize,
+) -> (AsyncLocalSender<T>, AsyncLocalReceiver<T>) {
+    let (s, r) = local_channel(bound, max_senders);
+
+    let s = AsyncLocalSender::new(s);
+    let r = AsyncLocalReceiver::new(r);
+
+    (s, r)
 }
 
 impl Shutdown for TcpStream {
@@ -370,13 +375,13 @@ struct Connection {
     stream: Stream,
     conn: ServerConnection,
     want: Want,
-    timer: Option<(usize, u64)>, // timer id, exp time
+    timer: Option<Instant>,
     zreceiver: channel::LocalReceiver<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)>,
-    keep_alive: Option<BatchKey>,
 }
 
 impl Connection {
     fn new_req(
+        now: Instant,
         stream: Stream,
         peer_addr: SocketAddr,
         buffer_size: usize,
@@ -396,7 +401,7 @@ impl Connection {
             stream,
             conn: ServerConnection::Req(
                 ServerReqConnection::new(
-                    Instant::now(),
+                    now,
                     Some(peer_addr),
                     secure,
                     buffer_size,
@@ -409,11 +414,11 @@ impl Connection {
             want: Want::nothing(),
             timer: None,
             zreceiver,
-            keep_alive: None,
         }
     }
 
     fn new_stream(
+        now: Instant,
         stream: Stream,
         peer_addr: SocketAddr,
         buffer_size: usize,
@@ -434,7 +439,7 @@ impl Connection {
             stream,
             conn: ServerConnection::Stream(
                 ServerStreamConnection::new(
-                    Instant::now(),
+                    now,
                     Some(peer_addr),
                     secure,
                     buffer_size,
@@ -448,16 +453,15 @@ impl Connection {
             want: Want::nothing(),
             timer: None,
             zreceiver,
-            keep_alive: None,
         }
     }
 
-    fn mode(&self) -> ZhttpMode {
+    /*fn mode(&self) -> ZhttpMode {
         match &self.conn {
             ServerConnection::Req(_, _) => ZhttpMode::Req,
             ServerConnection::Stream(_, _) => ZhttpMode::Stream,
         }
-    }
+    }*/
 
     fn state(&self) -> ServerState {
         match &self.conn {
@@ -468,26 +472,6 @@ impl Connection {
 
     fn get_tcp(&mut self) -> Option<&mut TcpStream> {
         self.stream.get_tcp()
-    }
-
-    fn get_zreq_sender(&self) -> &channel::LocalSender<zmq::Message> {
-        match &self.conn {
-            ServerConnection::Req(_, sender) => sender,
-            ServerConnection::Stream(_, _) => panic!("not req conn"),
-        }
-    }
-
-    fn get_zstream_senders(&self) -> &StreamLocalSenders {
-        match &self.conn {
-            ServerConnection::Req(_, _) => panic!("not stream conn"),
-            ServerConnection::Stream(_, senders) => senders,
-        }
-    }
-
-    fn get_zreceiver(
-        &self,
-    ) -> &channel::LocalReceiver<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)> {
-        &self.zreceiver
     }
 
     fn set_out_stream_can_write(&self) {
@@ -636,80 +620,6 @@ impl Connection {
 
         false
     }
-
-    fn deregister(&mut self, poller: &event::Poller) {
-        if let Some(stream) = self.stream.get_tcp() {
-            poller.deregister(stream).unwrap();
-        }
-
-        match &self.conn {
-            ServerConnection::Req(_, sender) => {
-                poller
-                    .deregister_custom_local(sender.get_write_registration())
-                    .unwrap();
-            }
-            ServerConnection::Stream(_, senders) => {
-                poller
-                    .deregister_custom_local(&senders.out.get_write_registration())
-                    .unwrap();
-                poller
-                    .deregister_custom_local(&senders.out_stream.get_write_registration())
-                    .unwrap();
-            }
-        }
-
-        poller
-            .deregister_custom_local(self.zreceiver.get_read_registration())
-            .unwrap();
-    }
-}
-
-struct ConnectionData {
-    shared: Option<arena::Rc<ServerStreamSharedData>>,
-    zreceiver_sender: channel::LocalSender<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)>,
-    resp_sending_key: Option<usize>,
-}
-
-struct KeySet {
-    index: Vec<bool>,
-    queue: VecDeque<u32>,
-}
-
-impl KeySet {
-    fn new(capacity: usize) -> Self {
-        u32::try_from(capacity).unwrap();
-
-        let mut index = Vec::with_capacity(capacity);
-        index.resize(capacity, false);
-
-        let queue = VecDeque::with_capacity(capacity);
-
-        Self { index, queue }
-    }
-
-    fn add(&mut self, key: usize) {
-        let k = u32::try_from(key).unwrap();
-
-        if self.index[key] {
-            return;
-        }
-
-        self.queue.push_back(k);
-        self.index[key] = true;
-    }
-
-    fn take(&mut self) -> Option<usize> {
-        match self.queue.pop_front() {
-            Some(k) => {
-                let key = k as usize;
-
-                self.index[key] = false;
-
-                Some(key)
-            }
-            None => None,
-        }
-    }
 }
 
 struct BatchKey {
@@ -852,6 +762,196 @@ impl Batch {
     }
 }
 
+fn gen_id(id: usize, ckey: usize, next_cid: &mut u32) -> ArrayString<[u8; 32]> {
+    let mut buf = [0; 32];
+    let mut c = io::Cursor::new(&mut buf[..]);
+
+    write!(&mut c, "{}-{}-{:x}", id, ckey, next_cid).unwrap();
+
+    let size = c.position() as usize;
+
+    let s = str::from_utf8(&buf[..size]).unwrap();
+
+    *next_cid += 1;
+
+    ArrayString::from_str(s).unwrap()
+}
+
+struct ConnectionItem {
+    id: ArrayString<[u8; 32]>,
+    stop: AsyncLocalSender<()>,
+    zreceiver_sender: AsyncLocalSender<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)>,
+    shared: Option<arena::Rc<ServerStreamSharedData>>,
+    keep_alive: Option<BatchKey>,
+}
+
+struct ConnectionItems {
+    nodes: Slab<list::Node<ConnectionItem>>,
+    next_cid: u32,
+    batch: Batch,
+}
+
+impl ConnectionItems {
+    fn new(capacity: usize, batch: Batch) -> Self {
+        Self {
+            nodes: Slab::with_capacity(capacity),
+            next_cid: 0,
+            batch,
+        }
+    }
+}
+
+struct ConnectionsInner {
+    active: list::List,
+    count: usize,
+}
+
+struct Connections {
+    items: Rc<RefCell<ConnectionItems>>,
+    inner: RefCell<ConnectionsInner>,
+}
+
+impl Connections {
+    fn new(items: Rc<RefCell<ConnectionItems>>) -> Self {
+        Self {
+            items,
+            inner: RefCell::new(ConnectionsInner {
+                active: list::List::default(),
+                count: 0,
+            }),
+        }
+    }
+
+    fn req_add(
+        &self,
+        worker_id: usize,
+        stop: AsyncLocalSender<()>,
+        zreceiver_sender: AsyncLocalSender<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)>,
+        shared: Option<arena::Rc<ServerStreamSharedData>>,
+    ) -> Result<(usize, ArrayString<[u8; 32]>), ()> {
+        let items = &mut *self.items.borrow_mut();
+        let c = &mut *self.inner.borrow_mut();
+
+        if items.nodes.len() == items.nodes.capacity() {
+            return Err(());
+        }
+
+        let nkey = items.nodes.insert(list::Node::new(ConnectionItem {
+            id: ArrayString::new(),
+            stop,
+            zreceiver_sender,
+            shared,
+            keep_alive: None,
+        }));
+
+        items.nodes[nkey].value.id = gen_id(worker_id, nkey, &mut items.next_cid);
+
+        c.active.push_back(&mut items.nodes, nkey);
+        c.count += 1;
+
+        Ok((nkey, items.nodes[nkey].value.id))
+    }
+
+    fn req_remove(&self, cid: usize) {
+        let nkey = cid;
+
+        let items = &mut *self.items.borrow_mut();
+        let c = &mut *self.inner.borrow_mut();
+
+        let cv = &mut items.nodes[nkey].value;
+
+        // clear active keep alive
+        if let Some(bkey) = cv.keep_alive.take() {
+            items.batch.remove(bkey);
+        }
+
+        c.active.remove(&mut items.nodes, nkey);
+        c.count -= 1;
+
+        items.nodes.remove(nkey);
+    }
+
+    fn req_regen_id(&self, worker_id: usize, cid: usize) -> ArrayString<[u8; 32]> {
+        let nkey = cid;
+
+        let items = &mut *self.items.borrow_mut();
+
+        let cv = &mut items.nodes[nkey].value;
+
+        // clear active keep alive
+        if let Some(bkey) = cv.keep_alive.take() {
+            items.batch.remove(bkey);
+        }
+
+        cv.id = gen_id(worker_id, nkey, &mut items.next_cid);
+
+        cv.id
+    }
+
+    fn req_count(&self) -> usize {
+        self.inner.borrow().count
+    }
+
+    /*fn req_take_first(&self) -> Option<(usize, AsyncLocalSender<()>)> {
+        let items = &mut *self.items.borrow_mut();
+        let c = &mut *self.inner.borrow_mut();
+
+        match c.active.head {
+            Some(nkey) => {
+                c.active.remove(&mut items.nodes, nkey);
+                c.count -= 1;
+
+                let ci = items.nodes.remove(nkey).value;
+
+                Some((nkey, ci.stop))
+            }
+            None => None,
+        }
+    }*/
+
+    async fn req_resp_send(
+        &self,
+        key: usize,
+        id: &[u8],
+        zresp: arena::Rc<zhttppacket::OwnedResponse>,
+    ) -> Result<(), ()> {
+        let items = &*self.items.borrow_mut();
+
+        match items.nodes.get(key) {
+            Some(n) => {
+                let ci = &n.value;
+
+                if ci.id.as_ref().as_bytes() != id {
+                    // key found but cid mismatch
+                    return Err(());
+                }
+
+                ci.zreceiver_sender.send((zresp, None)).await.unwrap();
+
+                Ok(())
+            }
+            None => Err(()),
+        }
+    }
+}
+
+struct ConnectionReqOpts {
+    body_buffer_size: usize,
+    sender: channel::LocalSender<zmq::Message>,
+}
+
+struct ConnectionStreamOpts {
+    messages_max: usize,
+    sender: channel::LocalSender<zmq::Message>,
+    sender_stream: channel::LocalSender<(ArrayVec<[u8; 64]>, zmq::Message)>,
+    stream_shared_mem: Rc<arena::RcMemory<ServerStreamSharedData>>,
+}
+
+enum ConnectionModeOpts {
+    Req(ConnectionReqOpts),
+    Stream(ConnectionStreamOpts),
+}
+
 struct Worker {
     thread: Option<thread::JoinHandle<()>>,
     stop: channel::Sender<()>,
@@ -878,8 +978,8 @@ impl Worker {
     ) -> Self {
         debug!("worker {}: starting", id);
 
-        let (s, r) = channel::channel(1);
-        let (rs, rr) = channel::channel(1);
+        let (stop, r_stop) = channel::channel(1);
+        let (s_ready, ready) = channel::channel(1);
 
         let instance_id = String::from(instance_id);
         let req_acceptor_tls = req_acceptor_tls.clone();
@@ -887,53 +987,1210 @@ impl Worker {
         let identities = Arc::clone(identities);
         let zsockman = Arc::clone(zsockman);
 
+        let maxconn = req_maxconn + stream_maxconn;
+
         let thread = thread::spawn(move || {
-            Self::run(
-                instance_id,
-                id,
-                req_maxconn,
-                stream_maxconn,
-                buffer_size,
-                body_buffer_size,
-                messages_max,
-                req_timeout,
-                stream_timeout,
-                r,
-                req_acceptor,
-                stream_acceptor,
-                &req_acceptor_tls,
-                &stream_acceptor_tls,
-                identities,
-                zsockman,
-                handle_bound,
-                rs,
+            let reactor = Reactor::new(
+                WORKER_NON_CONNECTION_REGISTRATIONS_MAX + (maxconn * REGISTRATIONS_PER_CONNECTION),
             );
+
+            let executor = Executor::new(WORKER_NON_CONNECTION_TASKS_MAX + maxconn);
+
+            {
+                let reactor = reactor.clone();
+
+                executor.set_pre_poll(move || {
+                    reactor.set_budget(Some(REACTOR_BUDGET));
+                });
+            }
+
+            executor
+                .spawn(Self::run(
+                    r_stop,
+                    s_ready,
+                    instance_id,
+                    id,
+                    req_maxconn,
+                    stream_maxconn,
+                    buffer_size,
+                    body_buffer_size,
+                    messages_max,
+                    req_timeout,
+                    stream_timeout,
+                    req_acceptor,
+                    stream_acceptor,
+                    req_acceptor_tls,
+                    stream_acceptor_tls,
+                    identities,
+                    zsockman,
+                    handle_bound,
+                ))
+                .unwrap();
+
+            executor.run(|timeout| reactor.poll(timeout)).unwrap();
+
+            debug!("worker {}: stopped", id);
         });
 
-        rr.recv().unwrap();
+        ready.recv().unwrap();
 
         Self {
             thread: Some(thread),
-            stop: s,
+            stop,
         }
     }
 
-    fn gen_id(id: usize, ckey: usize, next_cid: &mut u32) -> ArrayString<[u8; 32]> {
-        let mut buf = [0; 32];
-        let mut c = io::Cursor::new(&mut buf[..]);
+    async fn run(
+        stop: channel::Receiver<()>,
+        ready: channel::Sender<()>,
+        instance_id: String,
+        id: usize,
+        req_maxconn: usize,
+        stream_maxconn: usize,
+        buffer_size: usize,
+        body_buffer_size: usize,
+        messages_max: usize,
+        req_timeout: Duration,
+        stream_timeout: Duration,
+        req_acceptor: channel::Receiver<(usize, TcpStream, SocketAddr)>,
+        stream_acceptor: channel::Receiver<(usize, TcpStream, SocketAddr)>,
+        req_acceptor_tls: Vec<(bool, Option<String>)>,
+        stream_acceptor_tls: Vec<(bool, Option<String>)>,
+        identities: Arc<IdentityCache>,
+        zsockman: Arc<zhttpsocket::SocketManager>,
+        handle_bound: usize,
+    ) {
+        let executor = Executor::current().unwrap();
+        let stop = AsyncReceiver::new(stop);
+        let req_acceptor = AsyncReceiver::new(req_acceptor);
+        let stream_acceptor = AsyncReceiver::new(stream_acceptor);
 
-        write!(&mut c, "{}-{}-{:x}", id, ckey, next_cid).unwrap();
+        debug!("worker {}: allocating buffers", id);
 
-        let size = c.position() as usize;
+        let rb_tmp = Rc::new(TmpBuffer::new(buffer_size));
 
-        let s = str::from_utf8(&buf[..size]).unwrap();
+        // large enough to fit anything
+        let packet_buf = Rc::new(RefCell::new(vec![0; buffer_size + body_buffer_size + 4096]));
 
-        *next_cid += 1;
+        // same size as working buffers
+        let tmp_buf = Rc::new(RefCell::new(vec![0; buffer_size]));
 
-        ArrayString::from_str(s).unwrap()
+        let instance_id = Rc::new(instance_id);
+
+        let ka_batch = (stream_maxconn + (KEEP_ALIVE_BATCHES - 1)) / KEEP_ALIVE_BATCHES;
+
+        let batch = Batch::new(ka_batch);
+
+        let conn_items = Rc::new(RefCell::new(ConnectionItems::new(
+            req_maxconn + stream_maxconn,
+            batch,
+        )));
+
+        let req_conns = Rc::new(Connections::new(conn_items.clone()));
+        let stream_conns = Rc::new(Connections::new(conn_items.clone()));
+
+        let (req_accept_stop, r_req_accept_stop) = async_local_channel(1, 1);
+        let (stream_accept_stop, r_stream_accept_stop) = async_local_channel(1, 1);
+        let (req_handle_stop, r_req_handle_stop) = async_local_channel(1, 1);
+        let (stream_handle_stop, r_stream_handle_stop) = async_local_channel(1, 1);
+        let (keep_alives_stop, r_keep_alives_stop) = async_local_channel(1, 1);
+
+        let (s_req_accept_done, req_accept_done) = async_local_channel(1, 1);
+        let (s_stream_accept_done, stream_accept_done) = async_local_channel(1, 1);
+        let (s_req_handle_done, req_handle_done) = async_local_channel(1, 1);
+        let (s_stream_handle_done, stream_handle_done) = async_local_channel(1, 1);
+        let (s_keep_alives_done, keep_alives_done) = async_local_channel(1, 1);
+
+        // max_senders is 1 per connection + 1 for the accept task
+        let (zreq_sender, zreq_receiver) = local_channel(handle_bound, req_maxconn + 1);
+
+        // max_senders is 1 per connection + 1 for the accept task
+        let (zstream_out_sender, zstream_out_receiver) =
+            local_channel(handle_bound, stream_maxconn + 1);
+
+        // max_senders is 1 per connection + 1 for the accept task + 1 for the handle task
+        let (zstream_out_stream_sender, zstream_out_stream_receiver) =
+            local_channel(handle_bound, stream_maxconn + 2);
+
+        let zreq_receiver = AsyncLocalReceiver::new(zreq_receiver);
+        let zstream_out_receiver = AsyncLocalReceiver::new(zstream_out_receiver);
+        let zstream_out_stream_receiver = AsyncLocalReceiver::new(zstream_out_stream_receiver);
+
+        let req_handle = zhttpsocket::AsyncClientReqHandle::new(
+            zsockman.client_req_handle(format!("{}-", id).as_bytes()),
+        );
+
+        let stream_handle = zhttpsocket::AsyncClientStreamHandle::new(
+            zsockman.client_stream_handle(format!("{}-", id).as_bytes()),
+        );
+
+        let stream_shared_mem = Rc::new(arena::RcMemory::new(stream_maxconn));
+
+        executor
+            .spawn(Self::accept_task(
+                "req_accept",
+                id,
+                r_req_accept_stop,
+                s_req_accept_done,
+                instance_id.clone(),
+                req_maxconn,
+                buffer_size,
+                req_timeout,
+                req_acceptor,
+                req_acceptor_tls,
+                identities.clone(),
+                executor.spawner(),
+                rb_tmp.clone(),
+                packet_buf.clone(),
+                tmp_buf.clone(),
+                req_conns.clone(),
+                ConnectionModeOpts::Req(ConnectionReqOpts {
+                    body_buffer_size,
+                    sender: zreq_sender,
+                }),
+            ))
+            .unwrap();
+
+        {
+            let zstream_out_stream_sender = zstream_out_stream_sender
+                .try_clone(&Reactor::current().unwrap().local_registration_memory())
+                .unwrap();
+
+            executor
+                .spawn(Self::accept_task(
+                    "stream_accept",
+                    id,
+                    r_stream_accept_stop,
+                    s_stream_accept_done,
+                    instance_id.clone(),
+                    stream_maxconn,
+                    buffer_size,
+                    stream_timeout,
+                    stream_acceptor,
+                    stream_acceptor_tls,
+                    identities.clone(),
+                    executor.spawner(),
+                    rb_tmp.clone(),
+                    packet_buf.clone(),
+                    tmp_buf.clone(),
+                    stream_conns.clone(),
+                    ConnectionModeOpts::Stream(ConnectionStreamOpts {
+                        messages_max,
+                        sender: zstream_out_sender,
+                        sender_stream: zstream_out_stream_sender,
+                        stream_shared_mem,
+                    }),
+                ))
+                .unwrap();
+        }
+
+        executor
+            .spawn(Self::req_handle_task(
+                id,
+                r_req_handle_stop,
+                s_req_handle_done,
+                zreq_receiver,
+                req_handle,
+                req_maxconn,
+                req_conns.clone(),
+            ))
+            .unwrap();
+
+        executor
+            .spawn(Self::stream_handle_task(
+                id,
+                r_stream_handle_stop,
+                s_stream_handle_done,
+                instance_id.clone(),
+                zstream_out_receiver,
+                zstream_out_stream_receiver,
+                stream_handle,
+                stream_maxconn,
+                stream_conns.clone(),
+            ))
+            .unwrap();
+
+        executor
+            .spawn(Self::keep_alives_task(
+                id,
+                r_keep_alives_stop,
+                s_keep_alives_done,
+                instance_id.clone(),
+                zstream_out_stream_sender,
+                stream_conns.clone(),
+            ))
+            .unwrap();
+
+        debug!("worker {}: started", id);
+
+        ready.send(()).unwrap();
+        drop(ready);
+
+        stop.recv().await.unwrap();
+
+        // ignore errors
+        let _ = req_accept_stop.send(()).await;
+        let _ = req_handle_stop.send(()).await;
+        let _ = stream_handle_stop.send(()).await;
+        let _ = keep_alives_stop.send(()).await;
+
+        // ensure stopped
+        let _ = req_accept_done.recv().await;
+        let _ = req_handle_done.recv().await;
+        let stream_handle = stream_handle_done.recv().await.unwrap();
+        let _ = keep_alives_done.recv().await;
+
+        let _ = stream_accept_stop.send(()).await;
+        let _ = stream_accept_done.recv().await;
+
+        // send cancels
+
+        let items = &mut *stream_conns.items.borrow_mut();
+        let batch = &mut items.batch;
+        let conns = &mut items.nodes;
+
+        batch.clear();
+
+        let mut next_cancel_index = 0;
+
+        while next_cancel_index < conns.capacity() {
+            while batch.len() < batch.capacity() && next_cancel_index < conns.capacity() {
+                let key = next_cancel_index;
+
+                next_cancel_index += 1;
+
+                if let Some(c) = conns.get_mut(key) {
+                    // only send cancels to stream connections
+                    let cshared = match &mut c.value.shared {
+                        Some(shared) => shared,
+                        None => continue,
+                    };
+
+                    let cshared = cshared.get();
+
+                    // only send cancels to connections with known handler addresses
+                    let addr_ref = cshared.to_addr();
+                    let addr = match addr_ref.get() {
+                        Some(addr) => addr,
+                        None => continue,
+                    };
+
+                    batch.add(addr, key).unwrap();
+                }
+            }
+
+            while let Some(group) = batch.take_group(|ckey| {
+                let c = &conns[ckey];
+                let cshared = c.value.shared.as_ref().unwrap().get();
+
+                (c.value.id.as_bytes(), cshared.out_seq())
+            }) {
+                debug!(
+                    "worker {}: sending cancels for {} sessions",
+                    id,
+                    group.ids().len()
+                );
+
+                let mut zreq = zhttppacket::Request::new_cancel(instance_id.as_bytes(), &[]);
+
+                zreq.multi = true;
+
+                assert!(group.ids.len() <= zhttppacket::IDS_MAX);
+
+                zreq.ids = group.ids();
+
+                let mut data = [0; BULK_PACKET_SIZE_MAX];
+
+                let size = match zreq.serialize(&mut data) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        error!(
+                            "failed to serialize keep-alive packet with {} ids: {}",
+                            zreq.ids.len(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let mut a = ArrayVec::<[u8; 64]>::new();
+                a.try_extend_from_slice(group.addr()).unwrap();
+
+                let buf = &data[..size];
+                let msg = zmq::Message::from(buf);
+
+                drop(group);
+
+                stream_handle.send_to_addr(&a, msg).await.unwrap();
+            }
+
+            // give zsockman some time to process pending messages
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
-    fn run(
+    async fn accept_task(
+        name: &str,
+        id: usize,
+        stop: AsyncLocalReceiver<()>,
+        _done: AsyncLocalSender<()>,
+        instance_id: Rc<String>,
+        mode_maxconn: usize,
+        buffer_size: usize,
+        timeout: Duration,
+        acceptor: AsyncReceiver<(usize, TcpStream, SocketAddr)>,
+        acceptor_tls: Vec<(bool, Option<String>)>,
+        identities: Arc<IdentityCache>,
+        spawner: Spawner,
+        rb_tmp: Rc<TmpBuffer>,
+        packet_buf: Rc<RefCell<Vec<u8>>>,
+        tmp_buf: Rc<RefCell<Vec<u8>>>,
+        conns: Rc<Connections>,
+        mode_opts: ConnectionModeOpts,
+    ) {
+        let mut tls_acceptors = Vec::new();
+
+        for config in acceptor_tls {
+            if config.0 {
+                let default_cert = config.1.as_ref().map(|s| s.as_str());
+                tls_acceptors.push(Some(TlsAcceptor::new(&identities, default_cert)));
+            } else {
+                tls_acceptors.push(None);
+            }
+        }
+
+        let reactor = Reactor::current().unwrap();
+
+        let (scdone, cdone) = channel::local_channel(
+            mode_maxconn,
+            mode_maxconn,
+            &reactor.local_registration_memory(),
+        );
+
+        let cdone = AsyncLocalReceiver::new(cdone);
+
+        debug!("worker {}: task started: {}", id, name);
+
+        loop {
+            if conns.req_count() >= mode_maxconn {
+                // wait for room
+                let cid = cdone.recv().await.unwrap();
+                conns.req_remove(cid);
+            }
+
+            let (pos, stream, peer_addr) =
+                match select_3(stop.recv(), cdone.recv(), acceptor.recv()).await {
+                    Select3::R1(_) => break,
+                    Select3::R2(result) => match result {
+                        Ok(cid) => {
+                            conns.req_remove(cid);
+                            continue;
+                        }
+                        Err(_) => continue, // ignore errors
+                    },
+                    Select3::R3(result) => match result {
+                        Ok(ret) => ret,
+                        Err(_) => continue, // ignore errors
+                    },
+                };
+
+            let stream = set_socket_opts(stream);
+
+            let stream = match &tls_acceptors[pos] {
+                Some(tls_acceptor) => match tls_acceptor.accept(stream) {
+                    Ok(stream) => {
+                        debug!("worker {}: tls accept", id);
+
+                        Stream::Tls(stream)
+                    }
+                    Err(e) => {
+                        error!("worker {}: tls accept: {}", id, e);
+                        break;
+                    }
+                },
+                None => {
+                    debug!("worker {}: plain accept", id);
+
+                    Stream::Plain(stream)
+                }
+            };
+
+            let (cstop, rcstop) = async_local_channel(1, 1);
+
+            let scdone = scdone
+                .try_clone(&reactor.local_registration_memory())
+                .unwrap();
+
+            match &mode_opts {
+                ConnectionModeOpts::Req(opts) => {
+                    let zreq_sender = opts
+                        .sender
+                        .try_clone(&reactor.local_registration_memory())
+                        .unwrap();
+
+                    let (zreq_receiver_sender, zreq_receiver) = local_channel(RESP_SENDER_BOUND, 1);
+
+                    let zreq_receiver_sender = AsyncLocalSender::new(zreq_receiver_sender);
+
+                    let (cid, fullcid) = conns
+                        .req_add(id, cstop, zreq_receiver_sender, None)
+                        .unwrap();
+
+                    debug!(
+                        "worker {}: req conn starting {} {}/{}",
+                        id,
+                        cid,
+                        conns.req_count(),
+                        mode_maxconn
+                    );
+
+                    if spawner
+                        .spawn(Self::connection_task(
+                            rcstop,
+                            scdone,
+                            id,
+                            cid,
+                            instance_id.clone(),
+                            fullcid,
+                            stream,
+                            peer_addr,
+                            zreq_receiver,
+                            buffer_size,
+                            timeout,
+                            rb_tmp.clone(),
+                            packet_buf.clone(),
+                            tmp_buf.clone(),
+                            conns.clone(),
+                            ConnectionModeOpts::Req(ConnectionReqOpts {
+                                body_buffer_size: opts.body_buffer_size,
+                                sender: zreq_sender,
+                            }),
+                            None,
+                        ))
+                        .is_err()
+                    {
+                        error!("failed to spawn connection_task");
+                    }
+                }
+                ConnectionModeOpts::Stream(opts) => {
+                    let zstream_out_sender = opts
+                        .sender
+                        .try_clone(&reactor.local_registration_memory())
+                        .unwrap();
+                    let zstream_out_stream_sender = opts
+                        .sender_stream
+                        .try_clone(&reactor.local_registration_memory())
+                        .unwrap();
+
+                    let (zstream_receiver_sender, zstream_receiver) =
+                        local_channel(RESP_SENDER_BOUND, 1);
+
+                    let zstream_receiver_sender = AsyncLocalSender::new(zstream_receiver_sender);
+
+                    let shared =
+                        arena::Rc::new(ServerStreamSharedData::new(), &opts.stream_shared_mem)
+                            .unwrap();
+
+                    let (cid, fullcid) = conns
+                        .req_add(
+                            id,
+                            cstop,
+                            zstream_receiver_sender,
+                            Some(arena::Rc::clone(&shared)),
+                        )
+                        .unwrap();
+
+                    debug!(
+                        "worker {}: stream conn starting {} {}/{}",
+                        id,
+                        cid,
+                        conns.req_count(),
+                        mode_maxconn
+                    );
+
+                    if spawner
+                        .spawn(Self::connection_task(
+                            rcstop,
+                            scdone,
+                            id,
+                            cid,
+                            instance_id.clone(),
+                            fullcid,
+                            stream,
+                            peer_addr,
+                            zstream_receiver,
+                            buffer_size,
+                            timeout,
+                            rb_tmp.clone(),
+                            packet_buf.clone(),
+                            tmp_buf.clone(),
+                            conns.clone(),
+                            ConnectionModeOpts::Stream(ConnectionStreamOpts {
+                                messages_max: opts.messages_max,
+                                sender: zstream_out_sender,
+                                sender_stream: zstream_out_stream_sender,
+                                stream_shared_mem: opts.stream_shared_mem.clone(),
+                            }),
+                            Some(shared),
+                        ))
+                        .is_err()
+                    {
+                        error!("failed to spawn connection_task");
+                    }
+                }
+            }
+        }
+
+        // note: we should be the only task touching conns at this point
+
+        let items = &mut *conns.items.borrow_mut();
+        let cinner = &mut *conns.inner.borrow_mut();
+
+        let mut next = cinner.active.head;
+        while let Some(nkey) = next {
+            let n = &items.nodes[nkey];
+
+            debug!("worker {}: stopping cid {}", id, nkey);
+            n.value.stop.send(()).await.unwrap();
+
+            next = n.next;
+        }
+
+        /*while let Some((cid, stop)) = conns.req_take_first() {
+            debug!("worker {}: stopping cid {}", id, cid);
+
+            match stop.send(()).await {
+                Ok(()) => {}
+                Err(mpsc::SendError(_)) => {}
+            }
+        }*/
+
+        drop(scdone);
+
+        loop {
+            match cdone.recv().await {
+                Ok(_) => {}
+                Err(mpsc::RecvError) => break,
+            }
+        }
+
+        debug!("worker {}: task stopped: {}", id, name);
+    }
+
+    async fn req_handle_task(
+        id: usize,
+        stop: AsyncLocalReceiver<()>,
+        _done: AsyncLocalSender<()>,
+        zreq_receiver: AsyncLocalReceiver<zmq::Message>,
+        req_handle: zhttpsocket::AsyncClientReqHandle,
+        req_maxconn: usize,
+        conns: Rc<Connections>,
+    ) {
+        let req_scratch_mem = Rc::new(arena::RcMemory::new(MSG_RETAINED_MAX * req_maxconn));
+        let req_resp_mem = Rc::new(arena::RcMemory::new(req_maxconn));
+
+        debug!("worker {}: task started: req_handle", id);
+
+        loop {
+            match select_3(stop.recv(), zreq_receiver.recv(), req_handle.recv()).await {
+                Select3::R1(_) => break,
+                // zreq_receiver.recv
+                Select3::R2(result) => match result {
+                    Ok(msg) => match req_handle.send(msg).await {
+                        Ok(()) => {}
+                        Err(e) => error!("req send error: {}", e),
+                    },
+                    Err(mpsc::RecvError) => break, // this can happen if accept+conns end first
+                },
+                // req_handle.recv
+                Select3::R3(result) => match result {
+                    Ok(msg) => {
+                        let scratch = arena::Rc::new(
+                            RefCell::new(zhttppacket::ResponseScratch::new()),
+                            &req_scratch_mem,
+                        )
+                        .unwrap();
+
+                        let zresp = match zhttppacket::OwnedResponse::parse(msg, 0, scratch) {
+                            Ok(zresp) => zresp,
+                            Err(e) => {
+                                warn!("worker {}: zhttp parse error: {}", id, e);
+                                continue;
+                            }
+                        };
+
+                        let zresp = arena::Rc::new(zresp, &req_resp_mem).unwrap();
+
+                        //req_resp_pending = Some(arena::Rc::clone(&zresp));
+
+                        let mut count = 0;
+
+                        for id in zresp.get().get().ids {
+                            let key = match get_key(&id.id) {
+                                Ok(key) => key,
+                                Err(_) => continue,
+                            };
+
+                            /*let c = match conns.get_mut(key) {
+                                Some(c) => c,
+                                None => continue,
+                            };
+
+                            if c.id.as_ref().as_bytes() != id.id {
+                                // key found but cid mismatch
+                                continue;
+                            }*/
+
+                            if conns
+                                .req_resp_send(key, id.id, arena::Rc::clone(&zresp))
+                                .await
+                                .is_ok()
+                            {
+                                count += 1;
+                            }
+
+                            /*let cdata = conns_data[key].as_mut().unwrap();
+
+                            let nkey = req_resp_sending_nodes.insert(list::Node::new((key, None)));
+
+                            cdata.resp_sending_key = Some(nkey);
+
+                            req_resp_sending.push_back(&mut req_resp_sending_nodes, nkey);*/
+                        }
+
+                        debug!("worker {}: queued zmq message for {} conns", id, count);
+                    }
+                    Err(e) => panic!("worker {}: handle read error {}", id, e),
+                },
+            }
+        }
+
+        debug!("worker {}: task stopped: req_handle", id);
+    }
+
+    async fn stream_handle_task(
+        id: usize,
+        stop: AsyncLocalReceiver<()>,
+        done: AsyncLocalSender<zhttpsocket::AsyncClientStreamHandle>,
+        instance_id: Rc<String>,
+        zstream_out_receiver: AsyncLocalReceiver<zmq::Message>,
+        zstream_out_stream_receiver: AsyncLocalReceiver<(ArrayVec<[u8; 64]>, zmq::Message)>,
+        stream_handle: zhttpsocket::AsyncClientStreamHandle,
+        stream_maxconn: usize,
+        conns: Rc<Connections>,
+    ) {
+        let stream_scratch_mem = Rc::new(arena::RcMemory::new(MSG_RETAINED_MAX * stream_maxconn));
+        let stream_resp_mem = Rc::new(arena::RcMemory::new(stream_maxconn));
+
+        debug!("worker {}: task started: stream_handle", id);
+
+        // FIXME: out and out_stream maybe shouldn't block each other?
+        loop {
+            match select_4(
+                stop.recv(),
+                zstream_out_receiver.recv(),
+                zstream_out_stream_receiver.recv(),
+                stream_handle.recv(),
+            )
+            .await
+            {
+                Select4::R1(_) => break,
+                // zstream_out_receiver.recv
+                Select4::R2(result) => match result {
+                    Ok(msg) => match stream_handle.send_to_any(msg).await {
+                        Ok(()) => {}
+                        Err(e) => error!("stream send error: {}", e),
+                    },
+                    Err(mpsc::RecvError) => break, // this can happen if accept+conns end first
+                },
+                // zstream_out_stream_receiver.recv
+                Select4::R3(result) => match result {
+                    Ok((addr, msg)) => match stream_handle.send_to_addr(addr.as_ref(), msg).await {
+                        Ok(()) => {}
+                        Err(e) => error!("stream send error: {}", e),
+                    },
+                    Err(mpsc::RecvError) => break, // this can happen if accept+conns end first
+                },
+                // stream_handle.recv
+                Select4::R4(result) => match result {
+                    Ok(msg) => {
+                        let msg_data = &msg.get()[..];
+
+                        let (addr, offset) = match get_addr_and_offset(msg_data) {
+                            Ok(ret) => ret,
+                            Err(_) => {
+                                warn!("worker {}: packet has unexpected format", id);
+                                continue;
+                            }
+                        };
+
+                        if addr != &*instance_id {
+                            warn!("worker {}: packet not for us", id);
+                            continue;
+                        }
+
+                        let scratch = arena::Rc::new(
+                            RefCell::new(zhttppacket::ResponseScratch::new()),
+                            &stream_scratch_mem,
+                        )
+                        .unwrap();
+
+                        let zresp = match zhttppacket::OwnedResponse::parse(msg, offset, scratch) {
+                            Ok(zresp) => zresp,
+                            Err(e) => {
+                                warn!("worker {}: zhttp parse error: {}", id, e);
+                                continue;
+                            }
+                        };
+
+                        let zresp = arena::Rc::new(zresp, &stream_resp_mem).unwrap();
+
+                        //req_resp_pending = Some(arena::Rc::clone(&zresp));
+
+                        let mut count = 0;
+
+                        for id in zresp.get().get().ids {
+                            let key = match get_key(&id.id) {
+                                Ok(key) => key,
+                                Err(_) => continue,
+                            };
+
+                            /*let c = match conns.get_mut(key) {
+                                Some(c) => c,
+                                None => continue,
+                            };
+
+                            if c.id.as_ref().as_bytes() != id.id {
+                                // key found but cid mismatch
+                                continue;
+                            }*/
+
+                            if conns
+                                .req_resp_send(key, id.id, arena::Rc::clone(&zresp))
+                                .await
+                                .is_ok()
+                            {
+                                count += 1;
+                            }
+
+                            /*let cdata = conns_data[key].as_mut().unwrap();
+
+                            let nkey = req_resp_sending_nodes.insert(list::Node::new((key, None)));
+
+                            cdata.resp_sending_key = Some(nkey);
+
+                            req_resp_sending.push_back(&mut req_resp_sending_nodes, nkey);*/
+                        }
+
+                        debug!("worker {}: queued zmq message for {} conns", id, count);
+                    }
+                    Err(e) => panic!("worker {}: handle read error {}", id, e),
+                },
+            }
+        }
+
+        // give the handle back
+        done.send(stream_handle).await.unwrap();
+
+        debug!("worker {}: task stopped: stream_handle", id);
+    }
+
+    async fn connection_task(
+        stop: AsyncLocalReceiver<()>,
+        done: channel::LocalSender<usize>,
+        wid: usize,
+        cid: usize,
+        instance_id: Rc<String>,
+        mut fullcid: ArrayString<[u8; 32]>,
+        mut stream: Stream,
+        peer_addr: SocketAddr,
+        zreceiver: channel::LocalReceiver<(arena::Rc<zhttppacket::OwnedResponse>, Option<u32>)>,
+        buffer_size: usize,
+        timeout: Duration,
+        rb_tmp: Rc<TmpBuffer>,
+        packet_buf: Rc<RefCell<Vec<u8>>>,
+        tmp_buf: Rc<RefCell<Vec<u8>>>,
+        conns: Rc<Connections>,
+        mode_opts: ConnectionModeOpts,
+        shared: Option<arena::Rc<ServerStreamSharedData>>,
+    ) {
+        let done = AsyncLocalSender::new(done);
+
+        debug!("worker {}: task started: connection-{}", wid, cid);
+
+        let reactor = Reactor::current().unwrap();
+
+        let stream_registration = reactor
+            .register_io(
+                stream.get_tcp().unwrap(),
+                mio::Interest::READABLE | mio::Interest::WRITABLE,
+            )
+            .unwrap();
+        let zreceiver_registration = reactor
+            .register_custom_local(zreceiver.get_read_registration(), mio::Interest::READABLE)
+            .unwrap();
+
+        let (zsender1_registration, zsender2_registration, mut c) = {
+            match mode_opts {
+                ConnectionModeOpts::Req(opts) => {
+                    let zsender_registration = reactor
+                        .register_custom_local(
+                            opts.sender.get_write_registration(),
+                            mio::Interest::WRITABLE,
+                        )
+                        .unwrap();
+
+                    let c = Connection::new_req(
+                        reactor.now(),
+                        stream,
+                        peer_addr,
+                        buffer_size,
+                        opts.body_buffer_size,
+                        &rb_tmp,
+                        timeout,
+                        opts.sender,
+                        zreceiver,
+                    );
+
+                    (zsender_registration, None, c)
+                }
+                ConnectionModeOpts::Stream(opts) => {
+                    let zsender_registration = reactor
+                        .register_custom_local(
+                            opts.sender.get_write_registration(),
+                            mio::Interest::WRITABLE,
+                        )
+                        .unwrap();
+
+                    let zsender_stream_registration = reactor
+                        .register_custom_local(
+                            opts.sender_stream.get_write_registration(),
+                            mio::Interest::WRITABLE,
+                        )
+                        .unwrap();
+
+                    let c = Connection::new_stream(
+                        reactor.now(),
+                        stream,
+                        peer_addr,
+                        buffer_size,
+                        opts.messages_max,
+                        &rb_tmp,
+                        timeout,
+                        StreamLocalSenders::new(opts.sender, opts.sender_stream),
+                        zreceiver,
+                        shared.unwrap(),
+                    );
+
+                    (zsender_registration, Some(zsender_stream_registration), c)
+                }
+            }
+        };
+
+        let using_tls = match &c.stream {
+            Stream::Tls(_) => true,
+            _ => false,
+        };
+
+        c.start(fullcid.as_ref());
+
+        let mut sleep = None;
+
+        'main: loop {
+            debug!("conn {}: process", c.id);
+
+            if c.process(
+                reactor.now(),
+                &instance_id,
+                &mut *packet_buf.borrow_mut(),
+                &mut *tmp_buf.borrow_mut(),
+            ) {
+                break;
+            }
+
+            if c.state() == ServerState::Ready {
+                fullcid = conns.req_regen_id(wid, cid);
+                c.start(fullcid.as_ref());
+                continue;
+            }
+
+            if let Some(want_exp_time) = c.want.timeout {
+                let mut add = false;
+
+                if let Some(exp_time) = c.timer {
+                    if want_exp_time != exp_time {
+                        add = true;
+                    }
+                } else {
+                    add = true;
+                }
+
+                if add {
+                    sleep = Some(AsyncSleep::new(want_exp_time));
+                    c.timer = Some(want_exp_time);
+                }
+            } else {
+                if c.timer.is_some() {
+                    sleep = None;
+                    c.timer = None;
+                }
+            }
+
+            loop {
+                let stream_wait = if c.want.sock_read || c.want.sock_write {
+                    let interest = if c.want.sock_read && c.want.sock_write {
+                        mio::Interest::READABLE | mio::Interest::WRITABLE
+                    } else if c.want.sock_read {
+                        mio::Interest::READABLE
+                    } else {
+                        mio::Interest::WRITABLE
+                    };
+
+                    Some(event_wait(&stream_registration, interest))
+                } else {
+                    None
+                };
+
+                let zreceiver_wait = if c.want.zhttp_read {
+                    Some(event_wait(&zreceiver_registration, mio::Interest::READABLE))
+                } else {
+                    None
+                };
+
+                let zsender1_wait = if c.want.zhttp_write {
+                    Some(event_wait(&zsender1_registration, mio::Interest::WRITABLE))
+                } else {
+                    None
+                };
+
+                let zsender2_wait = if let Some(reg) = &zsender2_registration {
+                    if c.want.zhttp_write_to {
+                        Some(event_wait(reg, mio::Interest::WRITABLE))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let sleep = if let Some(sleep) = &mut sleep {
+                    Some(sleep.sleep())
+                } else {
+                    None
+                };
+
+                match select_6(
+                    stop.recv(),
+                    select_option(stream_wait),
+                    select_option(zreceiver_wait),
+                    select_option(zsender1_wait),
+                    select_option(zsender2_wait),
+                    select_option(sleep),
+                )
+                .await
+                {
+                    Select6::R1(_) => break 'main,
+                    Select6::R2(readiness) => {
+                        stream_registration.set_ready(false);
+
+                        let readable = readiness.is_readable();
+                        let writable = readiness.is_writable();
+
+                        if readable {
+                            debug!("conn {}: sock read event", c.id);
+                        }
+
+                        // for TLS, set readable on all events
+                        if readable || using_tls {
+                            c.set_sock_readable();
+                        }
+
+                        if writable {
+                            debug!("conn {}: sock write event", c.id);
+                        }
+
+                        if (readable && c.want.sock_read) || (writable && c.want.sock_write) {
+                            break;
+                        }
+                    }
+                    Select6::R3(_) => {
+                        debug!("conn {}: zreceiver event", c.id);
+                        zreceiver_registration.set_ready(false);
+                        break;
+                    }
+                    Select6::R4(_) => {
+                        debug!("conn {}: zsender1 event", c.id);
+                        zsender1_registration.set_ready(false);
+                        break;
+                    }
+                    Select6::R5(_) => {
+                        debug!("conn {}: zsender2 event", c.id);
+                        zsender2_registration.as_ref().unwrap().set_ready(false);
+                        c.set_out_stream_can_write();
+                        break;
+                    }
+                    Select6::R6(_) => {
+                        debug!("conn {}: timeout", c.id);
+                        break;
+                    }
+                }
+            }
+        }
+
+        stream_registration
+            .deregister_io(c.get_tcp().unwrap())
+            .unwrap();
+
+        done.send(cid).await.unwrap();
+
+        debug!("worker {}: task stopped: connection-{}", wid, cid);
+    }
+
+    async fn keep_alives_task(
+        id: usize,
+        stop: AsyncLocalReceiver<()>,
+        _done: AsyncLocalSender<()>,
+        instance_id: Rc<String>,
+        sender: channel::LocalSender<(ArrayVec<[u8; 64]>, zmq::Message)>,
+        conns: Rc<Connections>,
+    ) {
+        debug!("worker {}: task started: keep_alives", id);
+
+        let reactor = Reactor::current().unwrap();
+
+        let mut next_keep_alive_time = reactor.now() + KEEP_ALIVE_INTERVAL;
+        let mut next_keep_alive = AsyncSleep::new(next_keep_alive_time);
+        let mut next_keep_alive_index = 0;
+
+        let sender_registration = reactor
+            .register_custom_local(sender.get_write_registration(), mio::Interest::WRITABLE)
+            .unwrap();
+
+        sender_registration.set_readiness(Some(mio::Interest::WRITABLE));
+
+        'main: loop {
+            while conns.items.borrow().batch.is_empty() {
+                // wait for next keep alive time
+                match select_2(stop.recv(), next_keep_alive.sleep()).await {
+                    Select2::R1(_) => break 'main,
+                    Select2::R2(_) => {}
+                }
+
+                // NOTE: the code below does not await, so we can borrow until we're done
+                let items = &mut *conns.items.borrow_mut();
+                let batch = &mut items.batch;
+                let conns = &mut items.nodes;
+
+                let mut wrapped = false;
+
+                for _ in 0..batch.capacity() {
+                    if wrapped {
+                        break;
+                    }
+
+                    let key = next_keep_alive_index;
+
+                    next_keep_alive_index += 1;
+
+                    if next_keep_alive_index == conns.capacity() {
+                        next_keep_alive_index = 0;
+                        wrapped = true;
+                    }
+
+                    if let Some(c) = conns.get_mut(key) {
+                        // only send keep-alives to stream connections
+                        let cshared = match &mut c.value.shared {
+                            Some(shared) => shared,
+                            None => continue,
+                        };
+
+                        //let cdata = conns_data[key].as_ref().unwrap();
+                        //let cshared = cdata.shared.as_ref().unwrap().get();
+                        let cshared = cshared.get();
+
+                        // only send keep-alives to connections with known handler addresses
+                        let addr_ref = cshared.to_addr();
+                        let addr = match addr_ref.get() {
+                            Some(addr) => addr,
+                            None => continue,
+                        };
+
+                        c.value.keep_alive = Some(batch.add(addr, key).unwrap());
+                    }
+                }
+
+                // keep steady pace
+                next_keep_alive_time += KEEP_ALIVE_INTERVAL;
+                next_keep_alive = AsyncSleep::new(next_keep_alive_time);
+            }
+
+            match select_2(
+                stop.recv(),
+                event_wait(&sender_registration, mio::Interest::WRITABLE),
+            )
+            .await
+            {
+                Select2::R1(_) => break,
+                Select2::R2(_) => {}
+            }
+
+            if !sender.check_send() {
+                // if check_send returns false, we'll be on the waitlist for a notification
+                sender_registration.clear_readiness(mio::Interest::WRITABLE);
+                continue;
+            }
+
+            // if check_send returns true, we are guaranteed to be able to send
+
+            // NOTE: the code below does not await, so we can borrow until we're done
+            let items = &mut *conns.items.borrow_mut();
+            let batch = &mut items.batch;
+            let conns = &mut items.nodes;
+
+            let now = reactor.now();
+
+            let group = batch
+                .take_group(|ckey| {
+                    let c = &conns[ckey];
+                    let cshared = c.value.shared.as_ref().unwrap().get();
+
+                    (c.value.id.as_bytes(), cshared.out_seq())
+                })
+                .unwrap();
+
+            debug!(
+                "worker {}: sending keep alives for {} sessions",
+                id,
+                group.ids().len()
+            );
+
+            let zreq = zhttppacket::Request::new_keep_alive(instance_id.as_bytes(), &[]);
+
+            send_batched(zreq, group.ids(), &sender, group.addr());
+
+            drop(group);
+
+            for &ckey in batch.last_group_ckeys() {
+                let c = &mut conns[ckey];
+                let cshared = c.value.shared.as_ref().unwrap().get();
+
+                cshared.inc_out_seq();
+                c.value.keep_alive = None;
+            }
+
+            if batch.is_empty() {
+                if now >= next_keep_alive_time + KEEP_ALIVE_INTERVAL {
+                    // got really behind somehow. just skip ahead
+                    next_keep_alive_time = now + KEEP_ALIVE_INTERVAL;
+                    next_keep_alive = AsyncSleep::new(next_keep_alive_time);
+                }
+            }
+        }
+
+        debug!("worker {}: task stopped: keep_alives", id);
+    }
+
+    /*fn run(
         instance_id: String,
         id: usize,
         req_maxconn: usize,
@@ -946,8 +2203,8 @@ impl Worker {
         stop: channel::Receiver<()>,
         req_acceptor: channel::Receiver<(usize, TcpStream, SocketAddr)>,
         stream_acceptor: channel::Receiver<(usize, TcpStream, SocketAddr)>,
-        req_acceptor_tls: &[(bool, Option<String>)],
-        stream_acceptor_tls: &[(bool, Option<String>)],
+        req_acceptor_tls: Vec<(bool, Option<String>)>,
+        stream_acceptor_tls: Vec<(bool, Option<String>)>,
         identities: Arc<IdentityCache>,
         zsockman: Arc<zhttpsocket::SocketManager>,
         handle_bound: usize,
@@ -2117,7 +3374,7 @@ impl Worker {
         }
 
         debug!("worker: {} stopped", id);
-    }
+    }*/
 }
 
 impl Drop for Worker {
