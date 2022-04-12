@@ -22,7 +22,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::str;
 
-pub const HEADERS_MAX: usize = 32;
+pub const HEADERS_MAX: usize = 64;
 
 const CHUNK_SIZE_MAX: usize = 0xffff;
 const CHUNK_HEADER_SIZE_MAX: usize = 6; // ffff\r\n
