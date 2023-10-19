@@ -44,7 +44,7 @@ const PRIVATE_SUBNETS: &[&str] = &[
 ];
 
 struct SimpleLogger {
-    local_offset: UtcOffset,
+    local_offset: Option<UtcOffset>,
 }
 
 impl log::Log for SimpleLogger {
@@ -57,7 +57,7 @@ impl log::Log for SimpleLogger {
             return;
         }
 
-        let now = OffsetDateTime::now_utc().to_offset(self.local_offset);
+        let now = OffsetDateTime::now_utc().to_offset(self.local_offset.unwrap_or(UtcOffset::UTC));
 
         let format = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
@@ -90,6 +90,12 @@ impl log::Log for SimpleLogger {
     fn flush(&self) {}
 }
 
+impl SimpleLogger {
+    pub(crate) fn offset_known(&self) -> bool {
+        self.local_offset.is_some()
+    }
+}
+
 static mut LOGGER: mem::MaybeUninit<SimpleLogger> = mem::MaybeUninit::uninit();
 
 fn get_simple_logger() -> &'static SimpleLogger {
@@ -97,8 +103,7 @@ fn get_simple_logger() -> &'static SimpleLogger {
 
     unsafe {
         INIT.call_once(|| {
-            let local_offset =
-                UtcOffset::current_local_offset().expect("failed to get local time offset");
+            let local_offset = UtcOffset::current_local_offset().ok();
 
             LOGGER.write(SimpleLogger { local_offset });
         });
@@ -425,7 +430,8 @@ fn main() {
         )
         .get_matches();
 
-    log::set_logger(get_simple_logger()).unwrap();
+    let logger = get_simple_logger();
+    log::set_logger(logger).unwrap();
 
     log::set_max_level(LevelFilter::Info);
 
@@ -449,6 +455,10 @@ fn main() {
     };
 
     log::set_max_level(level);
+
+    if !logger.offset_known() {
+        log::warn!("Failed to determine local time offset. Log timestamps will be in UTC.");
+    }
 
     if *matches.get_one("sizes").unwrap() {
         for (name, size) in condure::app::App::sizes() {

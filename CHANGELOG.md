@@ -1,6 +1,10 @@
 Condure Changelog
 =================
 
+Unreleased
+
+  * If local time offset can't be determined, log timestamps as UTC instead of panicking.
+
 v. 1.10.0 (2023-06-29)
 
   * Add support for outgoing connections.
