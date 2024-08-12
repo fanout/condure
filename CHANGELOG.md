@@ -1,6 +1,10 @@
 Condure Changelog
 =================
 
+v. 1.10.1 (2024-08-12)
+
+  * Fix build with recent rustc.
+
 v. 1.10.0 (2023-06-29)
 
   * Add support for outgoing connections.
