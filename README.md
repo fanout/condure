@@ -1,3 +1,5 @@
+**UPDATE**: This project has been merged into [Pushpin](https://github.com/fastly/pushpin) and the repository has been archived. The `pushpin-connmgr` program can be used as a drop-in substitute.
+
 # Condure
 
 Condure is a service that manages network connections in order to allow controlling the connections from multiple processes. It can manage incoming connections as well as outgoing connections. Applications communicate with Condure over [ZeroMQ](https://zeromq.org/).
